@@ -1,0 +1,966 @@
+"""
+Utilities for loading models and extracting activations.
+
+This module handles:
+- Model loading for different architectures (DeepSeek, Llama, Qwen, etc.)
+- Activation extraction at specific layers
+- Forward passes with hooks for intervention
+"""
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers.cache_utils import DynamicCache
+from typing import Optional, Dict, List, Tuple, Callable
+import gc
+from pathlib import Path
+
+
+# Model name mappings to HuggingFace identifiers
+MODEL_NAME_MAP = {
+    # DeepSeek models
+    "deepseek_v3": "deepseek-ai/DeepSeek-V3",
+    "deepseek_v2.5": "deepseek-ai/DeepSeek-V2.5",
+    "deepseek_v2": "deepseek-ai/DeepSeek-V2",
+
+    # Llama models
+    "llama_405b": "meta-llama/Llama-3.1-405B-Instruct",
+    "llama_70b": "meta-llama/Llama-3.1-70B-Instruct",
+    "llama_8b": "meta-llama/Llama-3.1-8B-Instruct",
+
+    # Qwen models
+    "qwen3_235b": "Qwen/Qwen3-235B-A22B-Instruct-2507",  # MoE: 235B total, 22B activated
+    "qwen_72b": "Qwen/Qwen2.5-72B-Instruct",
+    "qwen_32b": "Qwen/Qwen2.5-32B-Instruct",
+    "qwen_14b": "Qwen/Qwen2.5-14B-Instruct",
+    "qwen_7b": "Qwen/Qwen2.5-7B-Instruct",
+
+    # Moonshot AI models
+    "kimi_k2": "moonshotai/Kimi-K2-Instruct-0905",
+
+    # Gemma models (Google)
+    "gemma2_2b": "google/gemma-2-2b-it",
+    "gemma2_9b": "google/gemma-2-9b-it",
+    "gemma2_27b": "google/gemma-2-27b-it",
+    "gemma3_27b": "google/gemma-3-27b-it",
+
+    # Add more models as needed
+}
+
+# Models that come pre-quantized (skip BitsAndBytes quantization)
+PRE_QUANTIZED_MODELS = {
+    "kimi_k2",  # Uses FP8 quantization
+    "deepseek_v3",  # Uses FineGrainedFP8 quantization
+}
+
+
+class ModelWrapper:
+    """
+    Wrapper class for handling model loading, activation extraction, and generation.
+    """
+
+    def __init__(
+        self,
+        model_name: str,
+        device: str = "cuda",
+        dtype: torch.dtype = torch.bfloat16,
+        quantization_config: Optional[BitsAndBytesConfig] = None,
+    ):
+        """
+        Initialize model wrapper.
+
+        Args:
+            model_name: Model identifier (key from MODEL_NAME_MAP or HF path)
+            device: Device to load model on
+            dtype: Data type for model weights
+            quantization_config: BitsAndBytesConfig for quantization (8bit or 4bit)
+        """
+        self.model_name = model_name
+        self.device = device
+        self.dtype = dtype
+
+        # Get HuggingFace model path
+        self.hf_path = MODEL_NAME_MAP.get(model_name, model_name)
+
+        print(f"Loading model: {self.hf_path}")
+        if model_name in PRE_QUANTIZED_MODELS:
+            print(f"Device: {device}, dtype: {dtype} (note: model is pre-quantized with FP8, dtype ignored)")
+        else:
+            print(f"Device: {device}, dtype: {dtype}")
+
+        # Load tokenizer
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.hf_path,
+            trust_remote_code=True,
+        )
+
+        # Set padding side to left for decoder-only models (required for batch generation)
+        self.tokenizer.padding_side = 'left'
+
+        # Ensure tokenizer has pad token
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # Load model
+        load_kwargs = {
+            "pretrained_model_name_or_path": self.hf_path,
+            "trust_remote_code": True,
+            "device_map": "auto" if device == "cuda" else None,
+        }
+
+        if quantization_config is not None:
+            load_kwargs["quantization_config"] = quantization_config
+        else:
+            # All models now use 'dtype' instead of deprecated 'torch_dtype'
+            load_kwargs["dtype"] = dtype
+
+        try:
+            self.model = AutoModelForCausalLM.from_pretrained(**load_kwargs)
+        except Exception as e:
+            load_kwargs["torch_dtype"] = dtype
+            del load_kwargs["dtype"]
+            self.model = AutoModelForCausalLM.from_pretrained(**load_kwargs)
+
+        if device != "cuda":
+            self.model = self.model.to(device)
+
+        self.model.eval()
+
+        # Apply model-specific patches
+        self._apply_model_patches()
+
+        # Get number of layers
+        self.n_layers = self._get_n_layers()
+        print(f"Model loaded. Total layers: {self.n_layers}")
+
+        # Store hooks for cleanup
+        self.hooks = []
+
+    def _get_input_device(self):
+        """Get the device where inputs should be placed (handles device_map='auto')."""
+        # When using device_map="auto", model may be sharded across GPUs
+        # Use the device of the first model parameter (embedding layer)
+        return next(self.model.parameters()).device
+
+    def _apply_model_patches(self):
+        """Apply model-specific patches for compatibility."""
+        # Patch for Kimi and DeepSeek models: Add multiple cache compatibility methods to DynamicCache
+        if self.model_name in ["kimi_k2", "deepseek_v3"]:
+            patches_applied = False
+
+            # The Kimi model's custom code expects cache.seen_tokens
+            # but newer Transformers uses DynamicCache.get_seq_length()
+            if not hasattr(DynamicCache, 'seen_tokens'):
+                def seen_tokens_getter(self):
+                    """
+                    Compatibility property for older model code.
+                    Returns the total number of tokens seen (cache length).
+                    """
+                    try:
+                        # Get cache length from first layer
+                        return self.get_seq_length(layer_idx=0)
+                    except:
+                        # Fallback: cache not initialized yet
+                        return 0
+
+                def seen_tokens_setter(self, value):
+                    """Setter for seen_tokens (for compatibility, does nothing)."""
+                    pass
+
+                # Add the property to DynamicCache class with both getter and setter
+                DynamicCache.seen_tokens = property(seen_tokens_getter, seen_tokens_setter)
+                patches_applied = True
+
+            # Add get_max_length method which the Kimi model expects
+            if not hasattr(DynamicCache, 'get_max_length'):
+                def get_max_length_method(self):
+                    """
+                    Compatibility method - returns max sequence length.
+                    For DynamicCache, this is just the current sequence length.
+                    """
+                    try:
+                        # Return length from layer 0 as representative
+                        return self.get_seq_length(layer_idx=0)
+                    except:
+                        return 0
+
+                # Add the method to DynamicCache class
+                DynamicCache.get_max_length = get_max_length_method
+                patches_applied = True
+
+            # Add get_usable_length method which the Kimi model also expects
+            if not hasattr(DynamicCache, 'get_usable_length'):
+                def get_usable_length_method(self, seq_length, layer_idx=0):
+                    """
+                    Compatibility method - returns the usable cache length.
+
+                    Args:
+                        seq_length: Current total sequence length (prompt + cache + new tokens)
+                        layer_idx: Layer index
+
+                    Returns:
+                        Number of usable cache positions for this layer
+                    """
+                    # Return the actual cache length for this specific layer
+                    try:
+                        cache_length = self.get_seq_length(layer_idx)
+                        return cache_length
+                    except:
+                        # Fallback if cache not initialized for this layer
+                        return 0
+
+                # Add the method to DynamicCache class
+                DynamicCache.get_usable_length = get_usable_length_method
+                patches_applied = True
+
+            if patches_applied:
+                print(f"Applied cache compatibility patches for {self.model_name}")
+
+        # Patch for Gemma models: Fix rotary embedding dimension mismatch
+        # This addresses a bug where cos/sin tensors don't match q/k dimensions in GQA models
+        gemma_models = ["gemma_2b", "gemma_7b", "gemma2_2b", "gemma2_9b", "gemma2_27b", "gemma3_27b"]
+        if self.model_name in gemma_models:
+            # Determine which module to patch based on model type
+            if "gemma3" in self.model_name:
+                from transformers.models.gemma3 import modeling_gemma3 as gemma_module
+            else:
+                from transformers.models.gemma2 import modeling_gemma2 as gemma_module
+
+            # Save original function
+            original_apply_rotary = gemma_module.apply_rotary_pos_emb
+
+            def fixed_apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+                """Fixed version that handles dimension mismatches."""
+                cos = cos.unsqueeze(unsqueeze_dim)
+                sin = sin.unsqueeze(unsqueeze_dim)
+
+                # Fix dimension mismatch: slice cos/sin if they don't match q/k's last dimension
+                # This handles GQA where query has more heads than key/value
+                if cos.shape[-1] != q.shape[-1]:
+                    cos = cos[..., :q.shape[-1]]
+                    sin = sin[..., :q.shape[-1]]
+
+                q_embed = (q * cos) + (gemma_module.rotate_half(q) * sin)
+                k_embed = (k * cos) + (gemma_module.rotate_half(k) * sin)
+                return q_embed, k_embed
+
+            # Monkey-patch the function
+            gemma_module.apply_rotary_pos_emb = fixed_apply_rotary_pos_emb
+            print(f"Applied rotary embedding fix for {self.model_name}")
+
+    def _get_n_layers(self) -> int:
+        """Get number of transformer layers in model."""
+        if hasattr(self.model, 'model'):
+            # Standard decoder-only models have model.layers
+            if hasattr(self.model.model, 'layers'):
+                return len(self.model.model.layers)
+            # Multimodal models (e.g., Gemma 3) have model.language_model.layers
+            elif hasattr(self.model.model, 'language_model') and hasattr(self.model.model.language_model, 'layers'):
+                return len(self.model.model.language_model.layers)
+
+        # Fallback: try to infer from config
+        if hasattr(self.model.config, 'num_hidden_layers'):
+            return self.model.config.num_hidden_layers
+        elif hasattr(self.model.config, 'n_layer'):
+            return self.model.config.n_layer
+        elif hasattr(self.model.config, 'num_layers'):
+            return self.model.config.num_layers
+        # Check for nested text_config (e.g., Gemma 3, multimodal models)
+        elif hasattr(self.model.config, 'text_config') and hasattr(self.model.config.text_config, 'num_hidden_layers'):
+            return self.model.config.text_config.num_hidden_layers
+
+        raise ValueError(f"Could not determine number of layers for {self.model_name}")
+
+    def get_layer_module(self, layer_idx: int):
+        """
+        Get the transformer layer module at the specified index.
+
+        Args:
+            layer_idx: Layer index (0-indexed)
+
+        Returns:
+            The layer module
+        """
+        if hasattr(self.model, 'model'):
+            # Standard decoder-only models
+            if hasattr(self.model.model, 'layers'):
+                return self.model.model.layers[layer_idx]
+            # Multimodal models (e.g., Gemma 3) with separate language_model
+            elif hasattr(self.model.model, 'language_model') and hasattr(self.model.model.language_model, 'layers'):
+                return self.model.model.language_model.layers[layer_idx]
+
+        raise ValueError(f"Could not access layer {layer_idx} for {self.model_name}")
+
+    def extract_activations(
+        self,
+        prompts: List[str],
+        layer_idx: int,
+        token_idx: int = -1,
+    ) -> torch.Tensor:
+        """
+        Extract activations at a specific layer and token position.
+
+        Args:
+            prompts: List of text prompts
+            layer_idx: Layer index to extract from
+            token_idx: Token position to extract (-1 for last token)
+
+        Returns:
+            Tensor of shape [batch_size, hidden_dim] with activations
+        """
+        activations = []
+
+        def hook_fn(module, input, output):
+            # output is typically a tuple (hidden_states, ...)
+            if isinstance(output, tuple):
+                hidden_states = output[0]
+            else:
+                hidden_states = output
+
+            # Extract at specific token position
+            act = hidden_states[:, token_idx, :].detach().cpu()
+            activations.append(act)
+
+        # Register hook
+        layer_module = self.get_layer_module(layer_idx)
+        hook = layer_module.register_forward_hook(hook_fn)
+        self.hooks.append(hook)
+
+        # Tokenize
+        inputs = self.tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+        ).to(self._get_input_device())
+
+        # Forward pass (disable cache to avoid compatibility issues with some models)
+        with torch.no_grad():
+            _ = self.model(**inputs, use_cache=False)
+
+        # Clean up hook
+        hook.remove()
+        self.hooks.remove(hook)
+
+        # Stack activations
+        return torch.cat(activations, dim=0)
+
+    def generate_with_steering(
+        self,
+        prompt: str,
+        layer_idx: int,
+        steering_vector: torch.Tensor,
+        strength: float = 1.0,
+        max_new_tokens: int = 512,
+        temperature: float = 0.0,
+        steering_start_pos: Optional[int] = None,
+        **generation_kwargs,
+    ) -> str:
+        """
+        Generate text with activation steering applied at specified layer.
+
+        Args:
+            prompt: Input prompt
+            layer_idx: Layer to apply steering at
+            steering_vector: Vector to add to activations (shape: [hidden_dim])
+            strength: Multiplier for steering vector
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature (0 = greedy)
+            steering_start_pos: Token position to start steering from (None = all positions)
+            **generation_kwargs: Additional generation parameters
+
+        Returns:
+            Generated text
+        """
+        # Prepare steering vector
+        steering_vec = (steering_vector * strength).to(self.device).to(self.dtype)
+
+        def steering_hook(module, input, output):
+            # output is typically a tuple (hidden_states, ...)
+            if isinstance(output, tuple):
+                hidden_states = output[0]
+                batch_size, seq_len, hidden_dim = hidden_states.shape
+
+                # Move steering vector to the same device as hidden_states (for multi-GPU)
+                steering_vec_device = steering_vec.to(hidden_states.device)
+
+                if steering_start_pos is not None and steering_start_pos < seq_len:
+                    # Only apply steering from steering_start_pos onwards
+                    modified_hidden_states = hidden_states.clone()
+                    modified_hidden_states[:, steering_start_pos:, :] += steering_vec_device.view(1, 1, -1)
+                    return (modified_hidden_states,) + output[1:]
+                elif steering_start_pos is None:
+                    # Apply to all positions
+                    modified_hidden_states = hidden_states + steering_vec_device.view(1, 1, -1)
+                    return (modified_hidden_states,) + output[1:]
+                else:
+                    # steering_start_pos is beyond current sequence, no steering yet
+                    return output
+            else:
+                # Fallback for non-tuple output
+                # Move steering vector to the same device as output (for multi-GPU)
+                steering_vec_device = steering_vec.to(output.device)
+                if steering_start_pos is None:
+                    return output + steering_vec_device.view(1, 1, -1)
+                else:
+                    return output
+
+        # Register hook
+        layer_module = self.get_layer_module(layer_idx)
+        hook = layer_module.register_forward_hook(steering_hook)
+        self.hooks.append(hook)
+
+        # Tokenize
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self._get_input_device())
+        input_length = inputs['input_ids'].shape[1]
+
+        # Set generation parameters
+        gen_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "pad_token_id": self.tokenizer.pad_token_id,
+        }
+
+        # Add sampling parameters only if temperature > 0
+        if temperature > 0:
+            gen_kwargs["do_sample"] = True
+            gen_kwargs["temperature"] = temperature
+            # Only add additional kwargs when sampling (to avoid passing sampling params to greedy)
+            for k, v in generation_kwargs.items():
+                gen_kwargs[k] = v
+        # For greedy decoding (temperature <= 0), don't pass do_sample or any sampling params
+
+        # Disable cache for models with cache compatibility issues
+        # Note: DeepSeek V3 has attention mask tracking issues when using steering hooks + cache
+        # The cache works fine for regular generation, but not with activation steering
+        if self.model_name in ["kimi_k2", "deepseek_v3"]:
+            gen_kwargs["use_cache"] = False
+
+        # Generate
+        with torch.no_grad():
+            output_ids = self.model.generate(**inputs, **gen_kwargs)
+
+        # Clean up hook
+        hook.remove()
+        self.hooks.remove(hook)
+
+        # Decode only the newly generated tokens
+        new_tokens = output_ids[0][input_length:]
+        # Convert to list for tokenizers that expect list (not tensor)
+        if self.model_name in ["kimi_k2", "deepseek_v3"]:
+            output_text = self.tokenizer.decode(new_tokens.tolist(), skip_special_tokens=True)
+        else:
+            output_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+        return output_text.strip()
+
+    def generate(
+        self,
+        prompt: str,
+        max_new_tokens: int = 512,
+        temperature: float = 0.0,
+        **generation_kwargs,
+    ) -> str:
+        """
+        Generate text without steering (standard generation).
+
+        Args:
+            prompt: Input prompt
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature (0 = greedy)
+            **generation_kwargs: Additional generation parameters
+
+        Returns:
+            Generated text
+        """
+        inputs = self.tokenizer(prompt, return_tensors="pt").to(self._get_input_device())
+        input_length = inputs['input_ids'].shape[1]
+
+        # Set generation parameters
+        gen_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "pad_token_id": self.tokenizer.pad_token_id,
+        }
+
+        # Add sampling parameters only if temperature > 0
+        if temperature > 0:
+            gen_kwargs["do_sample"] = True
+            gen_kwargs["temperature"] = temperature
+            # Only add additional kwargs when sampling (to avoid passing sampling params to greedy)
+            for k, v in generation_kwargs.items():
+                gen_kwargs[k] = v
+        # For greedy decoding (temperature <= 0), don't pass do_sample or any sampling params
+
+        # Note: Regular generation (without hooks) can use cache for all models including DeepSeek V3
+        # Cache is only disabled for steering methods due to attention mask tracking issues
+
+        with torch.no_grad():
+            output_ids = self.model.generate(**inputs, **gen_kwargs)
+
+        # Decode only the newly generated tokens
+        new_tokens = output_ids[0][input_length:]
+        # Convert to list for tokenizers that expect list (not tensor)
+        if self.model_name in ["kimi_k2", "deepseek_v3"]:
+            output_text = self.tokenizer.decode(new_tokens.tolist(), skip_special_tokens=True)
+        else:
+            output_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+
+        return output_text.strip()
+
+    def generate_batch(
+        self,
+        prompts: List[str],
+        max_new_tokens: int = 512,
+        temperature: float = 0.0,
+        **generation_kwargs,
+    ) -> List[str]:
+        """
+        Generate text for a batch of prompts without steering.
+
+        Args:
+            prompts: List of input prompts
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature (0 = greedy)
+            **generation_kwargs: Additional generation parameters
+
+        Returns:
+            List of generated texts
+        """
+        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(self._get_input_device())
+        input_lengths = (inputs['attention_mask'].sum(dim=1)).tolist()
+
+        # Set generation parameters
+        gen_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "pad_token_id": self.tokenizer.pad_token_id,
+        }
+
+        # Add sampling parameters only if temperature > 0
+        if temperature > 0:
+            gen_kwargs["do_sample"] = True
+            gen_kwargs["temperature"] = temperature
+            for k, v in generation_kwargs.items():
+                gen_kwargs[k] = v
+
+        # Note: Regular batch generation (without hooks) can use cache for all models including DeepSeek V3
+        # Cache is only disabled for steering methods due to attention mask tracking issues
+
+        with torch.no_grad():
+            output_ids = self.model.generate(**inputs, **gen_kwargs)
+
+        # Decode only the newly generated tokens for each sample
+        outputs = []
+        for i, input_length in enumerate(input_lengths):
+            new_tokens = output_ids[i][input_length:]
+            # Convert to list for tokenizers that expect list (not tensor)
+            if self.model_name in ["kimi_k2", "deepseek_v3"]:
+                output_text = self.tokenizer.decode(new_tokens.tolist(), skip_special_tokens=True)
+            else:
+                output_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+            outputs.append(output_text.strip())
+
+        return outputs
+
+    def generate_batch_with_steering(
+        self,
+        prompts: List[str],
+        layer_idx: int,
+        steering_vector: torch.Tensor,
+        strength: float = 1.0,
+        max_new_tokens: int = 512,
+        temperature: float = 0.0,
+        steering_start_pos: Optional[int] = None,
+        **generation_kwargs,
+    ) -> List[str]:
+        """
+        Generate text for a batch of prompts with the same steering vector.
+
+        Args:
+            prompts: List of input prompts
+            layer_idx: Layer to apply steering at
+            steering_vector: Vector to add to activations (same for all prompts)
+            strength: Multiplier for steering vector
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature (0 = greedy)
+            steering_start_pos: Token position to start steering from
+            **generation_kwargs: Additional generation parameters
+
+        Returns:
+            List of generated texts
+        """
+        # Prepare steering vector
+        steering_vec = (steering_vector * strength).to(self.device).to(self.dtype)
+
+        def steering_hook(module, input, output):
+            # Handle both tuple and non-tuple outputs
+            if isinstance(output, tuple):
+                hidden_states = output[0]
+                rest_of_output = output[1:]
+            else:
+                hidden_states = output
+                rest_of_output = ()
+
+            batch_size, seq_len, hidden_dim = hidden_states.shape
+
+            # Move steering vector to the same device as hidden_states (for multi-GPU)
+            steering_vec_device = steering_vec.to(hidden_states.device)
+
+            if steering_start_pos is not None:
+                modified_hidden_states = hidden_states.clone()
+
+                # During generation with KV cache, seq_len will be 1 (only new token)
+                # We want to steer ALL generated tokens, so apply unconditionally
+                if seq_len == 1:
+                    # Generation phase: apply steering to the new token
+                    modified_hidden_states += steering_vec_device.view(1, 1, -1)
+                elif steering_start_pos < seq_len:
+                    # Prompt processing phase: apply steering from start_pos onwards
+                    modified_hidden_states[:, steering_start_pos:, :] += steering_vec_device.view(1, 1, -1)
+
+                # Return in the same format as input
+                if isinstance(output, tuple):
+                    return (modified_hidden_states,) + rest_of_output
+                else:
+                    return modified_hidden_states
+            else:
+                # Apply to all positions
+                modified_hidden_states = hidden_states + steering_vec_device.view(1, 1, -1)
+                if rest_of_output:
+                    return (modified_hidden_states,) + rest_of_output
+                else:
+                    return modified_hidden_states
+
+        # Register hook
+        layer_module = self.get_layer_module(layer_idx)
+        hook = layer_module.register_forward_hook(steering_hook)
+        self.hooks.append(hook)
+
+        # Tokenize with padding
+        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(self._get_input_device())
+        input_lengths = (inputs['attention_mask'].sum(dim=1)).tolist()
+
+        # Adjust steering positions for left padding
+        # When using left padding, shorter prompts get padding tokens added to the left,
+        # which shifts all token indices. We need to adjust steering positions accordingly.
+        if steering_pos_tensor is not None and self.tokenizer.padding_side == "left":
+            max_length = inputs['input_ids'].shape[1]
+            padding_amounts = [max_length - length for length in input_lengths]
+            steering_pos_tensor = steering_pos_tensor + torch.tensor(padding_amounts, device=self.device)
+
+        # Set generation parameters
+        gen_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "pad_token_id": self.tokenizer.pad_token_id,
+        }
+
+        if temperature > 0:
+            gen_kwargs["do_sample"] = True
+            gen_kwargs["temperature"] = temperature
+            for k, v in generation_kwargs.items():
+                gen_kwargs[k] = v
+
+        # Disable cache for models with cache compatibility issues
+        # Note: DeepSeek V3 has attention mask tracking issues when using steering hooks + cache
+        # The cache works fine for regular generation, but not with activation steering
+        if self.model_name in ["kimi_k2", "deepseek_v3"]:
+            gen_kwargs["use_cache"] = False
+
+        # Generate
+        with torch.no_grad():
+            output_ids = self.model.generate(**inputs, **gen_kwargs)
+
+        # Clean up hook
+        hook.remove()
+        self.hooks.remove(hook)
+
+        # Decode only the newly generated tokens for each sample
+        outputs = []
+        for i, input_length in enumerate(input_lengths):
+            new_tokens = output_ids[i][input_length:]
+            # Convert to list for tokenizers that expect list (not tensor)
+            if self.model_name in ["kimi_k2", "deepseek_v3"]:
+                output_text = self.tokenizer.decode(new_tokens.tolist(), skip_special_tokens=True)
+            else:
+                output_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+            outputs.append(output_text.strip())
+
+        return outputs
+
+    def generate_batch_with_multi_steering(
+        self,
+        prompts: List[str],
+        layer_idx: int,
+        steering_vectors: List[torch.Tensor],
+        strength: float = 1.0,
+        max_new_tokens: int = 512,
+        temperature: float = 0.0,
+        steering_start_positions: Optional[List[int]] = None,
+        debug: bool = False,
+        **generation_kwargs,
+    ) -> List[str]:
+        """
+        Generate text for a batch of prompts with DIFFERENT steering vectors per prompt.
+
+        Args:
+            prompts: List of input prompts
+            layer_idx: Layer to apply steering at
+            steering_vectors: List of vectors (one per prompt)
+            strength: Multiplier for steering vectors
+            max_new_tokens: Maximum tokens to generate
+            temperature: Sampling temperature (0 = greedy)
+            steering_start_positions: List of token positions to start steering from (one per prompt)
+            **generation_kwargs: Additional generation parameters
+
+        Returns:
+            List of generated texts
+        """
+        # Some models have issues with batched generation + steering hooks
+        # Fall back to sequential generation
+        if self.model_name in ["kimi_k2", "deepseek_v3"]:
+            outputs = []
+            for i, prompt in enumerate(prompts):
+                steering_vec = steering_vectors[i]
+                start_pos = steering_start_positions[i] if steering_start_positions else None
+                output = self.generate_with_steering(
+                    prompt=prompt,
+                    layer_idx=layer_idx,
+                    steering_vector=steering_vec,
+                    strength=strength,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    steering_start_pos=start_pos,
+                    **generation_kwargs,
+                )
+                outputs.append(output)
+            return outputs
+        assert len(prompts) == len(steering_vectors), "Must have one steering vector per prompt"
+
+        # Prepare steering vectors: shape [batch_size, hidden_dim]
+        steering_vecs = torch.stack([v * strength for v in steering_vectors]).to(self.device).to(self.dtype)
+
+        # Convert steering positions to tensor if provided
+        if steering_start_positions is not None:
+            assert len(steering_start_positions) == len(prompts), "Must have one steering position per prompt"
+            # Convert to tensor: [batch_size]
+            steering_pos_tensor = torch.tensor(steering_start_positions, device=self.device)
+        else:
+            steering_pos_tensor = None
+
+        # Track hook calls for debugging
+        hook_calls = []
+
+        def steering_hook(module, input, output):
+            # Handle both tuple and non-tuple outputs
+            if isinstance(output, tuple):
+                hidden_states = output[0]
+                rest_of_output = output[1:]
+            else:
+                hidden_states = output
+                rest_of_output = ()
+
+            batch_size, seq_len, hidden_dim = hidden_states.shape
+
+            if debug and len(hook_calls) == 0:
+                print(f"[DEBUG] Hook fired! seq_len={seq_len}, batch={batch_size}, output_is_tuple={isinstance(output, tuple)}")
+                if steering_pos_tensor is not None:
+                    print(f"[DEBUG] steering_pos_tensor={steering_pos_tensor.tolist()}")
+
+            if steering_pos_tensor is not None:
+                modified_hidden_states = hidden_states.clone()
+
+                # Move steering vectors to the same device as hidden_states (for multi-GPU)
+                steering_vecs_device = steering_vecs.to(hidden_states.device)
+
+                # During generation with KV cache, seq_len will be 1 (only new token)
+                # We want to steer ALL generated tokens, so apply unconditionally
+                if seq_len == 1:
+                    # Generation phase: apply steering to the new token
+                    for i in range(batch_size):
+                        modified_hidden_states[i, :, :] += steering_vecs_device[i]
+
+                    if debug:
+                        hook_calls.append(f"GEN (seq_len=1, batch={batch_size})")
+                else:
+                    # Prompt processing phase: apply steering from start_pos onwards
+                    steered_count = 0
+                    for i in range(batch_size):
+                        start_pos = steering_pos_tensor[i].item()
+                        if start_pos < seq_len:
+                            modified_hidden_states[i, start_pos:, :] += steering_vecs_device[i]
+                            steered_count += 1
+
+                    if debug:
+                        hook_calls.append(f"PROMPT (seq_len={seq_len}, batch={batch_size}, steered={steered_count})")
+
+                # Return in the same format as input
+                if isinstance(output, tuple):
+                    return (modified_hidden_states,) + rest_of_output
+                else:
+                    return modified_hidden_states
+            else:
+                # Apply to all positions
+                # Move steering vectors to the same device as hidden_states (for multi-GPU)
+                steering_vecs_device = steering_vecs.to(hidden_states.device)
+                modified_hidden_states = hidden_states + steering_vecs_device.unsqueeze(1)
+
+                # Return in the same format as input
+                if isinstance(output, tuple):
+                    return (modified_hidden_states,) + rest_of_output
+                else:
+                    return modified_hidden_states
+
+        # Register hook
+        layer_module = self.get_layer_module(layer_idx)
+        hook = layer_module.register_forward_hook(steering_hook)
+        self.hooks.append(hook)
+
+        # Tokenize with padding
+        inputs = self.tokenizer(prompts, return_tensors="pt", padding=True, truncation=True).to(self._get_input_device())
+        input_lengths = (inputs['attention_mask'].sum(dim=1)).tolist()
+
+        # Adjust steering positions for left padding
+        # When using left padding, shorter prompts get padding tokens added to the left,
+        # which shifts all token indices. We need to adjust steering positions accordingly.
+        if steering_pos_tensor is not None and self.tokenizer.padding_side == "left":
+            max_length = inputs['input_ids'].shape[1]
+            padding_amounts = [max_length - length for length in input_lengths]
+            steering_pos_tensor = steering_pos_tensor + torch.tensor(padding_amounts, device=self.device)
+
+        # Set generation parameters
+        gen_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "pad_token_id": self.tokenizer.pad_token_id,
+        }
+
+        if temperature > 0:
+            gen_kwargs["do_sample"] = True
+            gen_kwargs["temperature"] = temperature
+            for k, v in generation_kwargs.items():
+                gen_kwargs[k] = v
+
+        # Disable cache for models with cache compatibility issues
+        # Note: DeepSeek V3 has attention mask tracking issues when using steering hooks + cache
+        # The cache works fine for regular generation, but not with activation steering
+        if self.model_name in ["kimi_k2", "deepseek_v3"]:
+            gen_kwargs["use_cache"] = False
+
+        # Generate
+        with torch.no_grad():
+            output_ids = self.model.generate(**inputs, **gen_kwargs)
+
+        # Clean up hook
+        hook.remove()
+        self.hooks.remove(hook)
+
+        # Print debug info if requested
+        if debug:
+            print(f"\n[DEBUG] Multi-steering hook called {len(hook_calls)} times:")
+            prompt_calls = [c for c in hook_calls if c.startswith("PROMPT")]
+            gen_calls = [c for c in hook_calls if c.startswith("GEN")]
+            print(f"  - Prompt processing: {len(prompt_calls)} calls")
+            if prompt_calls:
+                print(f"    {prompt_calls[0]}")
+            print(f"  - Generation: {len(gen_calls)} calls (one per generated token)")
+            print(f"  - Expected: 1 prompt + {max_new_tokens} generation = {1 + max_new_tokens} total")
+            if len(hook_calls) == 1 + max_new_tokens * len(prompts):
+                print(f"  ✓ Steering applied correctly!")
+            else:
+                print(f"  ✗ WARNING: Expected {1 + max_new_tokens * len(prompts)}, got {len(hook_calls)}")
+
+        # Decode only the newly generated tokens for each sample
+        outputs = []
+        for i, input_length in enumerate(input_lengths):
+            new_tokens = output_ids[i][input_length:]
+            # Convert to list for tokenizers that expect list (not tensor)
+            if self.model_name in ["kimi_k2", "deepseek_v3"]:
+                output_text = self.tokenizer.decode(new_tokens.tolist(), skip_special_tokens=True)
+            else:
+                output_text = self.tokenizer.decode(new_tokens, skip_special_tokens=True)
+            outputs.append(output_text.strip())
+
+        return outputs
+
+    def cleanup(self):
+        """Remove all hooks and free memory."""
+        if hasattr(self, 'hooks'):
+            for hook in self.hooks:
+                hook.remove()
+            self.hooks = []
+
+        if hasattr(self, 'model'):
+            del self.model
+        if hasattr(self, 'tokenizer'):
+            del self.tokenizer
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def __del__(self):
+        """Cleanup on deletion."""
+        try:
+            self.cleanup()
+        except:
+            pass
+
+
+def get_layer_at_fraction(model_wrapper: ModelWrapper, fraction: float) -> int:
+    """
+    Get layer index at a specific fraction through the model.
+
+    Args:
+        model_wrapper: Model wrapper instance
+        fraction: Fraction through model (e.g., 0.67 for 2/3)
+
+    Returns:
+        Layer index
+    """
+    layer_idx = int(model_wrapper.n_layers * fraction)
+    # Clamp to valid range
+    return max(0, min(layer_idx, model_wrapper.n_layers - 1))
+
+
+def load_model(
+    model_name: str,
+    device: str = "cuda",
+    dtype: str = "bfloat16",
+    quantization: Optional[str] = None,
+) -> ModelWrapper:
+    """
+    Convenience function to load a model.
+
+    Args:
+        model_name: Model identifier
+        device: Device to load on
+        dtype: Data type (bfloat16, float16, float32)
+        quantization: Quantization scheme (8bit, 4bit, or None)
+
+    Returns:
+        ModelWrapper instance
+    """
+    dtype_map = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }
+
+    # Create quantization config if requested
+    quantization_config = None
+
+    # Check if model is pre-quantized (skip BitsAndBytes quantization)
+    if model_name in PRE_QUANTIZED_MODELS:
+        if quantization is not None:
+            print(f"Note: {model_name} is pre-quantized (FP8). Ignoring BitsAndBytes {quantization} quantization.")
+        quantization_config = None
+    elif quantization == "8bit":
+        quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+    elif quantization == "4bit":
+        quantization_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=dtype_map.get(dtype, torch.bfloat16),
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4",
+        )
+
+    return ModelWrapper(
+        model_name=model_name,
+        device=device,
+        dtype=dtype_map.get(dtype, torch.bfloat16),
+        quantization_config=quantization_config,
+    )
