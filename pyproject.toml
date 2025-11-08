@@ -1,118 +1,53 @@
-[build-system]
-requires = ["setuptools>=61.0", "wheel"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "introspective-awareness"
 version = "0.1.0"
-description = "Replicating the 'injected thoughts' experiment from Emergent Introspective Awareness in Large Language Models on open-source models"
+description = "Add your description here"
 readme = "README.md"
-authors = [
-    { name = "Uzay Macar" }
-]
-license = { text = "MIT" }
-requires-python = ">=3.8"
-classifiers = [
-    "Development Status :: 3 - Alpha",
-    "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.8",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
-]
-keywords = ["llm", "interpretability", "introspection", "activation-steering", "mechanistic-interpretability"]
-
+requires-python = ">=3.11"
 dependencies = [
-    "torch==2.6.0",
-    "transformers==4.55.0",
-    "accelerate==1.4.0",
-    "openai==1.82.1",
-    "python-dotenv==1.1.0",
-    "pandas==2.3.3",
-    "numpy==1.26.4",
-    "matplotlib==3.5.1",
-    "tqdm==4.67.1",
-    "bitsandbytes==0.46.1",
-    "scikit-learn==0.23.2",
-    "scipy==1.11.4",
-    "seaborn==0.13.2",
-    "sae-lens==6.18.0",
-    "plotly==6.1.2",
-    "datasets==3.6.0",
-    "huggingface-hub==0.34.3",
-    "einops==0.8.0",
+    # Core PyTorch
+    "torch==2.7.0",
+    "torchaudio==2.7.0",
+    "torchvision==0.22.0",
+    # CUDA / cuDNN / related NVIDIA libs
+    "nvidia-cublas-cu12==12.6.4.1",
+    "nvidia-cuda-cupti-cu12==12.6.80",
+    "nvidia-cuda-nvrtc-cu12==12.6.77",
+    "nvidia-cuda-runtime-cu12==12.6.77",
+    "nvidia-cudnn-cu12==9.5.1.17",
+    "nvidia-cufft-cu12==11.3.0.4",
+    "nvidia-cufile-cu12==1.11.1.6",
+    "nvidia-curand-cu12==10.3.7.77",
+    "nvidia-cusolver-cu12==11.7.1.2",
+    "nvidia-cusparse-cu12==12.5.4.2",
+    "nvidia-cusparselt-cu12==0.6.3",
+    "nvidia-nccl-cu12==2.26.2",
+    "nvidia-nvjitlink-cu12==12.6.85",
+    "nvidia-nvtx-cu12==12.6.77",
+    # Optional CUDA utility + kernel compilation tools
+    "triton==3.3.0",
+    "cupy-cuda12x==13.5.1",
+    "fastrlock==0.8.3",
+    # Flash Attention (custom wheel below)
+    "flash-attn",
+    "ipykernel>=7.1.0",
+    "python-dotenv>=1.2.1",
+    "tqdm>=4.67.1",
+    "pandas>=2.3.3",
+    "datasets>=4.4.1",
+    "scipy>=1.16.3",
+    "scikit-learn>=1.7.2",
+    "seaborn>=0.13.2",
+    "openai>=2.7.1",
+    "rollouts>=0.1.11",
+    "anthropic>=0.72.0",
+    "matplotlib>=3.10.7",
+    "accelerate>=1.11.0",
+    "packaging>=25.0",
+    "ninja>=1.13.0",
+    "cpufeature>=0.2.1",
 ]
 
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.0.0",
-    "black>=23.0.0",
-    "ruff>=0.1.0",
-    "mypy>=1.0.0",
-]
-
-[project.urls]
-Homepage = "https://github.com/uzaymacar/introspective-awareness"
-Repository = "https://github.com/uzaymacar/introspective-awareness"
-Dataset = "https://huggingface.co/datasets/uzaymacar/introspective-awareness"
-Paper = "https://transformer-circuits.pub/2025/introspection/index.html"
-
-[project.scripts]
-detect-injected-thoughts = "detect_injected_thoughts:main"
-
-[tool.setuptools]
-py-modules = ["detect_injected_thoughts", "model_utils", "vector_utils", "steering_utils", "eval_utils"]
-
-[tool.black]
-line-length = 100
-target-version = ["py38", "py39", "py310", "py311"]
-include = '\.pyi?$'
-exclude = '''
-/(
-    \.git
-  | \.venv
-  | \.eggs
-  | build
-  | dist
-  | results
-)/
-'''
-
-[tool.ruff]
-line-length = 100
-target-version = "py38"
-select = [
-    "E",  # pycodestyle errors
-    "W",  # pycodestyle warnings
-    "F",  # pyflakes
-    "I",  # isort
-    "C",  # flake8-comprehensions
-    "B",  # flake8-bugbear
-]
-ignore = [
-    "E501",  # line too long (handled by black)
-    "B008",  # do not perform function calls in argument defaults
-    "C901",  # too complex
-]
-
-[tool.ruff.per-file-ignores]
-"__init__.py" = ["F401"]
-
-[tool.mypy]
-python_version = "3.8"
-warn_return_any = true
-warn_unused_configs = true
-disallow_untyped_defs = false
-ignore_missing_imports = true
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-python_files = ["test_*.py"]
-python_classes = ["Test*"]
-python_functions = ["test_*"]
-addopts = "-v --tb=short"
+[tool.uv.sources]
+flash-attn = { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.3.12/flash_attn-2.8.0+cu124torch2.7-cp311-cp311-linux_x86_64.whl" }
 
