@@ -46,6 +46,7 @@ dependencies = [
     "packaging>=25.0",
     "ninja>=1.13.0",
     "cpufeature>=0.2.1",
+    "transformers>=4.57.1",
 ]
 
 [tool.uv.sources]

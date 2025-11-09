@@ -1,3 +1,4 @@
+#%%
 """
 Experiment 1: Injected Thoughts Detection (Baseline)
 
@@ -29,7 +30,7 @@ import sys
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
-from tqdm import tqdm
+from tqdm.auto import tqdm
 matplotlib.use('Agg')
 
 from model_utils import load_model, get_layer_at_fraction, ModelWrapper
@@ -48,7 +49,7 @@ from steering_utils import (
 )
 from eval_utils import LLMJudge, batch_evaluate, compute_detection_and_identification_metrics, save_evaluation_results
 import random
-
+#%%
 # Default test concepts (50 words from the paper)
 DEFAULT_TEST_CONCEPTS = [
     "Dust", "Satellites", "Trumpets", "Origami", "Illusions",

@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import time
-from tqdm import tqdm
+from tqdm.auto import tqdm
 
 # Load environment variables from .env file
 load_dotenv()
